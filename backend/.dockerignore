@@ -1,0 +1,21 @@
+**/*_test.go
+# Packages the server never imports (go list -deps ./cmd/server): the load client (built on the host
+# by scripts/stress.sh) and the test-only database helpers. Out of the build context, a change to
+# them keeps the image's COPY . . layer, and so its compile, cached (CI's type=gha cache).
+cmd/stress/
+internal/integration/
+internal/testdb/
+**/testdata/
+.env
+.env.*
+*.md
+*.out
+coverage.*
+.golangci.yml
+bin/
+tmp/
+# Local `go build` outputs: never part of the image, and they would bust the COPY . . cache.
+/server
+/stress
+.git
+.gitignore

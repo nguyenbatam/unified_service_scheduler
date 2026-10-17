@@ -1,0 +1,2457 @@
+openapi: 3.0.3
+info:
+  title: Unified Service Scheduler API
+  version: 1.6.0
+  description: |
+    Keyloop Scenario A — resource-constrained booking (bay + technician).
+
+    **Auth:** `POST /auth/login` or `/auth/register`, then `Authorization: Bearer <token>`.
+    All business APIs require JWT. Public: health, docs, login/register/refresh. The access token
+    is short-lived (`ACCESS_TOKEN_TTL`, default 15 min) and carries `sid` (the login session) and
+    `sexp` (the session's absolute end); login and register also set the refresh cookie —
+    `__Host-uss_refresh` (`HttpOnly; Secure; SameSite=Strict; Path=/`, no `Domain`) by default, or
+    `uss_refresh` (`HttpOnly; SameSite=Strict; Path=/api/v1/auth`) when `AUTH_COOKIE_SECURE=false`
+    (a plain-http local stack only) — which `POST /auth/refresh` trades for a new access token,
+    rotating the cookie (each refresh token lives `SESSION_IDLE_TTL`, default 24 h; the session ends
+    `SESSION_MAX_TTL` after login, default 7 days, never extended). Only the configured name is
+    read; a request carrying it twice is 401 with the cookie cleared. Presenting a rotated refresh
+    token again after a 60 s grace is treated as theft: every session of the user is revoked (an
+    expired token is only a 401). An access token stops working once its session is revoked
+    (within `USER_CACHE_TTL` on other instances), e.g. by a new login on the same browser, and
+    sockets opened for it close at the next session sweep. Browsers keep the access token in
+    memory only. The user is reloaded
+    on every request (each instance may reuse the row for a few seconds, `USER_CACHE_TTL`,
+    default 5 s), so deactivation and role changes apply within that window; `POST /auth/logout`
+    (revokes every session of the user, refresh sessions included) applies at once on the
+    instance that served it and within the window everywhere else (sockets close as soon as the
+    event arrives).
+
+    **Cookie requests (CSRF):** `POST /auth/refresh`, and `POST /auth/logout` without a Bearer
+    token, authenticate with the cookie alone, so they require `X-Requested-With: fetch` (a custom
+    header: cross-site pages cannot send it without a CORS preflight, which is never allowed) and,
+    when an `Origin` header is sent, the request's own origin (scheme from `X-Forwarded-Proto` when
+    the peer is a trusted proxy, `TRUSTED_PROXIES`) or one of `ALLOWED_ORIGINS`; otherwise 403.
+    Login and register apply the same `Origin` rule (they set the cookie) and take only
+    `Content-Type: application/json` (parameters such as `charset` allowed; anything else is 400
+    `invalid`, so an HTML form cannot post a forged JSON body). Every auth write (login, register,
+    refresh, logout) refuses `Sec-Fetch-Site: cross-site` with 403. Non-browser clients send no
+    `Origin` and may refresh with the cookie and the header.
+
+    **Roles:** admin (1) and dispatcher (2) are staff; customer (3) sees and acts only on their own
+    vehicles and appointments (others return 404). Staff-only routes return 403 for customers.
+    Staff belong to a dealership (`user.dealershipId`): they only see and act on that dealership's
+    board and appointments (other dealerships' appointments return 404, dealership-level calls 403).
+    An admin without a dealership is group-wide; only a group admin edits the shared service catalog.
+
+    **Optimistic concurrency:** appointment and admin config responses carry `ETag: "<version>"`.
+    Send it back as `If-Match` on mutations; a stale version returns 412.
+
+    **Compression:** responses of 1 KiB or more are compressed when the request's `Accept-Encoding`
+    allows it (`zstd` preferred, then `gzip`; `Vary: Accept-Encoding` is set). The `ETag` stays the
+    strong `"<version>"` whatever the encoding, so it can be sent back as `If-Match` unchanged.
+    `/auth/*` responses (they carry tokens) are never compressed.
+
+    **Time rules (per dealership, `Dealership.policy`):** no booking in the past; customers need
+    `customerLeadMinutes` notice, book at most `bookingHorizonDays` ahead, and may cancel or
+    reschedule online until `customerChangeCutoffMinutes` before start (defaults 60 / 90 / 60).
+
+    **Job lines:** an appointment carries 1–5 services (`serviceTypeIds`), done by one technician
+    holding every required skill in one bay that fits every line, for the summed labour time. The
+    booked lines and requirements are a snapshot: later catalog edits apply to new bookings only.
+
+    **Rosters:** technicians may have weekly shifts with a break and dated absences; they are only
+    allocated (or reassigned) when on duty for the whole window.
+
+    **Busy:** any request that waits too long on a database lock (e.g. behind an admin change), or
+    runs past the server's request deadline (`REQUEST_TIMEOUT`, default 20 s, covering connection
+    pool waits and every statement), returns 503 `busy` with `Retry-After: 1`; retry it. The
+    deadline only cuts waits before the commit, so a 503 normally means nothing was saved; to be
+    safe, retry a booking with the same `Idempotency-Key` (it replays) and re-read before retrying
+    other changes (a 412 on retry means the record changed since your read).
+
+    **Rate limits** (429 with `Retry-After`): customers per user and per client IP on availability
+    (120/min per user, 600/min per IP; `/availability/next` counts one unit per started week of
+    `days`), writes — bookings, cancels, reschedules, vehicle registration (30/min per user,
+    120/min per IP) — and plain reads — `GET /appointments`, `/appointments/{id}`, `/vehicles`,
+    `/vehicles/{id}`, `/dealerships`, `/service-types` (`READ_LIMIT_PER_USER` /
+    `READ_LIMIT_PER_IP`, default 600/min per user, 3000/min per IP; a 304 counts too; `/auth/me`
+    is never throttled); WS tickets 30/min per user (staff too); register per IP (5/15 min) and cluster-wide (300/15 min; a taken email answers 409, so these bound probing for accounts);
+    login per IP (20/5 min), per IP + email (10/5 min), and per account on failed passwords
+    (50/15 min, after which every attempt on that account is 429 until the window ends). Staff
+    are not counted by the availability, write, and read limits. Limits are shared by every
+    instance (Redis); while Redis is unavailable, login and register limits are enforced per
+    instance and the others are not enforced.
+
+    **Request bodies** are one JSON object of at most 1 MiB (413 `too_large` beyond); unknown
+    fields and anything after the object are 400.
+
+    **Errors** share one envelope (`ErrorEnvelope`). Every authenticated route can also answer
+    401 (`Unauthorized`) and 503 `busy` (`Busy`); unexpected failures are 500 `internal` with no
+    detail.
+
+    **Enums (SMALLINT, from 1):** status 1–6, bay 1–4, skill 1–3, role 1–3, skill level 1–4
+    (1 apprentice, 2 technician, 3 senior, 4 master), event type 1–15 (1–11 appointment events, 12
+    SESSION_REVOKED, 13 CONFIG_UPDATED, 14 AVAILABILITY_CHANGED, 15 CONNECTED; 14–15 WebSocket only),
+    aggregate type 1–5 (1 appointment, 2 dealership, 3 service_type, 4 technician, 5 user).
+
+    **Pagination:** every list endpoint (`GET /dealerships`, `/service-types`, `/vehicles`,
+    `/customers`, `/appointments`, `/appointments/{id}/history`, `/admin/technicians`,
+    `/admin/outbox/failed`) answers one page: the body is a plain JSON array, and when more rows
+    follow, the `X-Next-Cursor` header carries an opaque token — pass it back as `cursor` with the
+    same filters for the next page (it is absent on the last page; a page that has one is always
+    full). `limit` sizes the page (each list states its default and maximum). Pages are keyset
+    pages over a stable, unique order ending with the id: the token carries the last row's sort
+    values (never a row to look up), so rows inserted or deleted between two pages — the cursor
+    row itself included — never make another row repeat or be skipped, and a removed filter target
+    just yields an empty last page. A row whose sort key is edited between two pages (a renamed
+    customer, a rescheduled appointment) may show on both pages or on neither; it never causes an
+    error or an endless loop. A token is bound to its list and filters (another list's, other
+    filters', or a tampered token is 400); do not parse it, its format may change. Not paged, by
+    design: `/schedule` (one dealership day), `/availability` and `/availability/next` (one
+    bounded date range), and the single-object `/admin/dealerships/{id}/calendar` (at most 366
+    upcoming closures) and `/admin/technicians/{id}/roster` (at most 7 shifts and 100 upcoming
+    absences).
+  contact:
+    name: Demo
+servers:
+  - url: /api/v1
+    description: Relative to gateway or backend
+security:
+  - bearerAuth: []
+tags:
+  - name: health
+  - name: auth
+  - name: catalog
+  - name: booking
+  - name: workshop
+  - name: admin
+  - name: realtime
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Readiness (alias of /health/ready)
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Ready" }
+        "503": { $ref: "#/components/responses/Ready" }
+
+  /health/ready:
+    get:
+      tags: [health]
+      summary: Readiness — can this instance serve requests?
+      description: |
+        503 only when Postgres is unreachable. Redis is reported in `checks` but is not fatal (every
+        Redis use fails open), so a Redis outage gives 200 `degraded`. The probe result is shared
+        for 1 s, so polling costs at most one round trip per dependency per second per instance.
+        Postgres is probed over a connection of its own, outside the request pool, so it reports
+        reachability only; `checks.pool` is `saturated` while every request-pool connection is in
+        use (requests queue for one) — 200 `degraded`, not an outage.
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Ready" }
+        "503": { $ref: "#/components/responses/Ready" }
+
+  /health/live:
+    get:
+      tags: [health]
+      summary: Liveness — the process serves HTTP (touches no dependency)
+      security: []
+      responses:
+        "200":
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  instance: { type: string }
+
+  /auth/register:
+    post:
+      tags: [auth]
+      summary: Register a self-service customer (creates the linked customer record)
+      description: >-
+        Starts a login session like login (refresh cookie; a refresh cookie the request carried is
+        revoked first). The body must be sent as `Content-Type: application/json` (else 400).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterRequest" }
+      responses:
+        "201":
+          description: Created; access token + a new login session (refresh cookie)
+          headers:
+            Set-Cookie: { $ref: "#/components/headers/RefreshCookie" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "409":
+          description: |
+            Email already registered. This does reveal that an address has an account (login does
+            not: wrong email and wrong password look alike and cost the same time). Accepted trade-off:
+            a sign-up form has to say why it failed, and probing is bounded by the per-IP register
+            limit (20 per 5 min, 429).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Login (rate limited per IP, per IP + email, and per account on failed passwords)
+      description: >-
+        Attempts for one account from one address (IPv6: one /64) are limited first (10 per 5 min,
+        right or wrong password); other addresses are unaffected until the account's failed
+        attempts from all addresses together reach 50 in 15 min. From then on every attempt on the
+        account is 429, right password or not, until the window ends. Starts a login session (refresh
+        cookie); if the request carries a refresh cookie, that session is revoked first (a new
+        login replaces this browser's previous session: its access tokens and sockets end too).
+        The body must be sent as `Content-Type: application/json` (else 400).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Access token + a new login session (refresh cookie)
+          headers:
+            Set-Cookie: { $ref: "#/components/headers/RefreshCookie" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Current user
+      description: |
+        Session check. Never throttled (unlike the other customer reads): clients treat a failure
+        here as a sign-out, so a shared-IP read bucket running dry must not end sessions.
+      responses:
+        "200":
+          description: User
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Trade the refresh cookie for a new access token (rotates the cookie)
+      description: |
+        Authenticated by the refresh cookie alone (no Bearer), so it requires
+        `X-Requested-With: fetch` and a same-origin (or allowlisted) `Origin` when one is sent — see
+        Cookie requests above. Every success marks the presented refresh token used and sets its
+        successor (same session; its expiry is `SESSION_IDLE_TTL` from now, capped at the session's
+        absolute end, which never moves).
+
+        Two requests racing with the same cookie (two tabs), or a retry after a lost response: the
+        first rotates; one presenting the token within 60 s of its rotation gets a fresh access
+        token for the same session and the **same** successor cookie again (no second rotation;
+        omitted once that successor has itself been rotated). Presented later, the rotated token is
+        treated as stolen: every session of the user is revoked (token version bumped, open sockets
+        closed, `SESSION_REVOKED`) and the answer is 401 — unless it has expired (idle or absolute):
+        an expired token is only a 401, checked first, rotated or not. A token of a session already revoked
+        (logout, a new login on the browser, a detected reuse) is only a 401: it revokes nothing
+        else. The user is re-read: a deactivated account's sessions are revoked (401).
+
+        Rate limited per client IP (`REFRESH_LIMIT_PER_IP`, default 60 per minute; not enforced
+        while Redis is unavailable).
+      security:
+        - refreshCookie: []
+      parameters:
+        - name: X-Requested-With
+          in: header
+          required: true
+          schema: { type: string, enum: [fetch] }
+      responses:
+        "200":
+          description: New access token. `Set-Cookie` carries the rotated refresh token (within the race grace, the same successor again while it is still the session's live token).
+          headers:
+            Set-Cookie: { $ref: "#/components/headers/RefreshCookie" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "401":
+          description: |
+            No session: the cookie is missing, sent twice, unknown, expired (idle or absolute),
+            revoked, or reused, or the account is disabled. The response clears the cookie
+            (`Max-Age=0`).
+          headers:
+            Set-Cookie: { $ref: "#/components/headers/ClearRefreshCookie" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Sign out every session of the current user
+      description: |
+        Bumps the user's token version, so all access tokens and WS tickets issued so far (other
+        tabs and devices too) stop working and open sockets close, revokes every refresh session of
+        the user, and clears the refresh cookie. The user is identified by a valid Bearer token, or
+        else by a live refresh cookie (then with the cookie-request CSRF rules: `X-Requested-With:
+        fetch`, same-origin `Origin` — and the refresh endpoint's per-IP budget,
+        `REFRESH_LIMIT_PER_IP`). `Sec-Fetch-Site: cross-site` is refused either way.
+      security:
+        - bearerAuth: []
+        - refreshCookie: []
+      parameters:
+        - name: X-Requested-With
+          in: header
+          required: false
+          description: Required (`fetch`) when the refresh cookie is what authenticates the request.
+          schema: { type: string, enum: [fetch] }
+      responses:
+        "204":
+          description: Signed out everywhere; the refresh cookie is cleared
+          headers:
+            Set-Cookie: { $ref: "#/components/headers/ClearRefreshCookie" }
+        "401":
+          description: Neither a valid Bearer token nor a live refresh cookie (the cookie is cleared)
+          headers:
+            Set-Cookie: { $ref: "#/components/headers/ClearRefreshCookie" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /auth/ws-ticket:
+    post:
+      tags: [auth, realtime]
+      summary: Short-lived (60 s), single-use ticket for opening the WebSocket
+      description: >-
+        Keeps the access token out of URLs (proxy and access logs). The ticket carries the login
+        session's absolute end (the access token's `sexp`): the socket stays open until then, not
+        just until the access token expires (sign-out closes it at once; a session revoked by a new
+        login on the browser at the next session sweep). Each ticket opens one socket; a replay is
+        401 (best effort: accepted again until expiry if Redis is unavailable). Rate limited to 30
+        tickets per minute per user. Answered with `Cache-Control: no-store`.
+      responses:
+        "200":
+          description: Ticket
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ticket: { type: string }
+                  expiresAt: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /dealerships:
+    get:
+      tags: [catalog]
+      summary: List dealerships, one page in name order
+      description: |
+        One page ordered by name, then id (see Pagination). Same list for every caller. Each
+        instance reuses each page's body for up to `CATALOG_CACHE_TTL`
+        (default 2 s, at most 5 s; only pages of the default or maximum `limit`, the first one and
+        those reached through `X-Next-Cursor`): an admin change made through another instance can show here
+        that much later (one made through this instance applies at once). The `ETag` is a hash of
+        the page (body and next cursor); send it as `If-None-Match` to get a body-less 304 while nothing changed. Send
+        `Cache-Control: no-cache` to skip the instance's cached body once it is over 0.5 s old (e.g. right after an edit or a
+        `CONFIG_UPDATED` event).
+      parameters:
+        - { $ref: "#/components/parameters/limit" }
+        - { $ref: "#/components/parameters/cursor" }
+        - { $ref: "#/components/parameters/ifNoneMatch" }
+        - { $ref: "#/components/parameters/cacheControlRequest" }
+      responses:
+        "200":
+          description: Dealerships
+          headers:
+            X-Next-Cursor: { $ref: "#/components/headers/NextCursor" }
+            ETag: { $ref: "#/components/headers/CatalogETag" }
+            Cache-Control: { schema: { type: string, example: "private, no-cache" } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Dealership" }
+        "304": { $ref: "#/components/responses/NotModified" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /service-types:
+    get:
+      tags: [catalog]
+      summary: List service types, one page in catalog order
+      description: |
+        One page ordered by labour time, then name, then id (see Pagination). Same list for every
+        caller. Each instance reuses each page's body for up to `CATALOG_CACHE_TTL`
+        (default 2 s, at most 5 s; only pages of the default or maximum `limit`, the first one and
+        those reached through `X-Next-Cursor`): an admin change made through another instance can show here
+        that much later (one made through this instance applies at once). The `ETag` is a hash of
+        the page (body and next cursor); send it as `If-None-Match` to get a body-less 304 while nothing changed. Send
+        `Cache-Control: no-cache` to skip the instance's cached body once it is over 0.5 s old (e.g. right after an edit or a
+        `CONFIG_UPDATED` event).
+      parameters:
+        - { $ref: "#/components/parameters/limit" }
+        - { $ref: "#/components/parameters/cursor" }
+        - { $ref: "#/components/parameters/ifNoneMatch" }
+        - { $ref: "#/components/parameters/cacheControlRequest" }
+      responses:
+        "200":
+          description: Service types
+          headers:
+            X-Next-Cursor: { $ref: "#/components/headers/NextCursor" }
+            ETag: { $ref: "#/components/headers/CatalogETag" }
+            Cache-Control: { schema: { type: string, example: "private, no-cache" } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ServiceType" }
+        "304": { $ref: "#/components/responses/NotModified" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /vehicles:
+    get:
+      tags: [catalog]
+      summary: Search vehicles, one page (customers get only their own)
+      description: |
+        One page ordered by owner name, make, model, then id (see Pagination). `q` narrows it to
+        vehicles whose VIN, make, model, or owner's name contains the text (case-insensitive; `%`,
+        `_` and `\` are matched literally).
+      parameters:
+        - name: q
+          in: query
+          description: Search text, trimmed; at most 100 characters.
+          schema: { type: string, maxLength: 100 }
+        - { $ref: "#/components/parameters/limit" }
+        - { $ref: "#/components/parameters/cursor" }
+      responses:
+        "200":
+          description: Vehicles
+          headers:
+            X-Next-Cursor: { $ref: "#/components/headers/NextCursor" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Vehicle" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+    post:
+      tags: [catalog]
+      summary: Register a vehicle (customers always for themselves; staff must pass customerId)
+      description: >-
+        VINs are unique across the group. A customer adding a VIN that is already registered (to
+        anyone) gets 409 with the generic message "this vehicle cannot be registered online; please
+        contact the dealership" (it names no owner); staff get the precise reason. The 409-vs-201
+        outcome itself still shows that a VIN is registered, so probing is bounded by the write rate
+        limit (429) rather than hidden; verifying ownership (e.g. V5C/registration document) before
+        registration is a follow-up. Counts as a write for rate limiting.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VehicleCreate" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Vehicle" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409":
+          description: VIN already registered (customers get a generic message)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /customers:
+    get:
+      tags: [catalog]
+      summary: Search customers, one page (staff only)
+      description: |
+        Customers are group-wide, like vehicles: a car owner is the group's customer, not one
+        dealership's, so any staff member can find a walk-in again. One page ordered by name, then
+        id (see Pagination); `q` narrows it to customers whose name, phone, or email contains the text (case-insensitive;
+        `%`, `_` and `\` are matched literally). Search text is never logged (the access log
+        records the path only). Throttled per user, staff included: 120 searches a minute.
+      parameters:
+        - name: q
+          in: query
+          description: Search text, trimmed; at most 100 characters.
+          schema: { type: string, maxLength: 100 }
+        - name: limit
+          in: query
+          description: Page size (see Pagination).
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - { $ref: "#/components/parameters/cursor" }
+      responses:
+        "200":
+          description: Customers
+          headers:
+            X-Next-Cursor: { $ref: "#/components/headers/NextCursor" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Customer" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+    post:
+      tags: [catalog]
+      summary: Record a walk-in customer (staff only; no user account)
+      description: >-
+        Creates a customer record staff can then add a vehicle for (`POST /vehicles` with
+        `customerId`) and book for. At least one of phone and email is required, so notifications
+        have somewhere to go. Duplicates are not detected: search first. Throttled per user, staff
+        included: 30 a minute.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CustomerCreate" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Customer" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /vehicles/{id}:
+    get:
+      tags: [catalog]
+      summary: Get a vehicle (404 for another customer's)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Vehicle
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Vehicle" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /availability:
+    get:
+      tags: [booking]
+      summary: Slot grid for a day
+      description: |
+        Unavailable slots carry `reason`: `past`, `lead_time` (customer notice), `beyond_horizon`
+        (customer booking window), `lunch_break`, `vehicle_busy` (the car is booked elsewhere then),
+        `staging_full`, `no_bay`, `no_technician` (none qualified, free, and on duty), `no_resources`.
+        Send `serviceTypeId` for one job line or `serviceTypeIds` for several (not both).
+
+        A slot is offered exactly when a booking would succeed, including by one repair move (see
+        `Slot.available`): its `freeBays`/`freeTechnicians` count only what is free without a move,
+        so an available slot may show 0.
+
+        A day whose opening hours are shorter than the job is still a 200: `slots` is empty and
+        `reason` is `day_too_short`. 400 is kept for invalid input, including a job longer than
+        every weekday's longest uninterrupted window at the dealership (it can never be booked).
+      parameters:
+        - { $ref: "#/components/parameters/dealershipId" }
+        - { $ref: "#/components/parameters/vehicleId" }
+        - { $ref: "#/components/parameters/serviceTypeId" }
+        - { $ref: "#/components/parameters/serviceTypeIds" }
+        - { $ref: "#/components/parameters/excludeAppointmentId" }
+        - name: date
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: isWaiter
+          in: query
+          description: "Default false; with excludeAppointmentId, omitted means the appointment's booked flag (what the reschedule keeps when its body omits isWaiter). Anything but a boolean (true/false, 1/0) is 400."
+          schema: { type: boolean }
+      responses:
+        "200":
+          description: Slots
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Availability" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404":
+          description: Vehicle not found (or not owned by the customer)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "409": { description: "excludeAppointmentId is not a confirmed appointment (it could not be rescheduled)", content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } } }
+        "422": { description: "excludeAppointmentId: a customer past the online change cutoff", content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /availability/next:
+    get:
+      tags: [booking]
+      summary: Next available (or suggested) starts, searched day by day
+      description: |
+        Scans from `from` (default today, never earlier) for `days` days (customers also stop at the
+        dealership's booking horizon) and returns the first `limit` bookable starts, at most `perDay`
+        of them from one day, in time order. Closed days and days too short for the job are
+        skipped; a job no weekday can hold is a 400. For rate
+        limiting it costs one unit per started week of `days` (default 14 days = 2, 31 days = 5).
+      parameters:
+        - { $ref: "#/components/parameters/dealershipId" }
+        - { $ref: "#/components/parameters/vehicleId" }
+        - { $ref: "#/components/parameters/serviceTypeId" }
+        - { $ref: "#/components/parameters/serviceTypeIds" }
+        - { $ref: "#/components/parameters/excludeAppointmentId" }
+        - name: isWaiter
+          in: query
+          description: "Default false; with excludeAppointmentId, omitted means the appointment's booked flag (what the reschedule keeps when its body omits isWaiter). Anything but a boolean (true/false, 1/0) is 400."
+          schema: { type: boolean }
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: days
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 31, default: 14 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 20, default: 5 }
+        - name: perDay
+          in: query
+          description: Most starts taken from one day, so a short list spans several days. Omitted, no cap.
+          schema: { type: integer, minimum: 1, maximum: 20 }
+        - name: prefer
+          in: query
+          description: |
+            `recommended` spends each day's share on its recommended starts (`recommended: true`:
+            booking them leaves no new idle gap on the bay and technician the engine would pick)
+            before its other bookable starts. Omitted: each day's earliest starts. The list is in
+            time order either way.
+          schema: { type: string, enum: [recommended] }
+      responses:
+        "200":
+          description: Slots
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NextAvailability" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: "excludeAppointmentId is not a confirmed appointment", content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } } }
+        "422": { description: "excludeAppointmentId: a customer past the online change cutoff", content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /schedule:
+    get:
+      tags: [workshop]
+      summary: Day board (bays, technicians, appointments) — staff of that dealership
+      parameters:
+        - { $ref: "#/components/parameters/dealershipId" }
+        - name: date
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: Schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Schedule" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments:
+    get:
+      tags: [booking]
+      summary: List appointments — all, upcoming, or past (customers get only their own)
+      description: |
+        One page (see Pagination). Without `when`: every appointment, by `startAt` descending, then
+        id. `when=upcoming`: confirmed appointments that have not ended yet, and every checked-in
+        or in-progress one whatever its `endAt` (the car is on site and the job still holds its
+        bay and technician, e.g. an overrun flagged without being extended); soonest first
+        (`startAt` ascending, then id) — today's work comes first however many bookings lie
+        ahead. `when=past`: exactly every other one (confirmed and ended, completed, cancelled,
+        no-show), newest first; `upcoming` + `past` = every appointment. "Now" is the server's
+        clock at each request, so an appointment that leaves `upcoming` between two pages (a
+        confirmed one ends; one is completed, cancelled or marked no-show) is not repeated, nor
+        is anything skipped. A token continues only the listing (`when`) and filters it came
+        from.
+      parameters:
+        - name: dealershipId
+          in: query
+          description: Staff filter; dealership-scoped staff always get only their dealership (another one is 403).
+          schema: { type: string, format: uuid }
+        - name: customerId
+          in: query
+          description: Staff filter; ignored for customers.
+          schema: { type: string, format: uuid }
+        - name: vehicleId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: when
+          in: query
+          description: "`upcoming` (confirmed and not yet ended, or checked in / in progress whatever `endAt`; soonest first) or `past` (every other one; newest first); omit for every appointment (newest first)."
+          schema: { type: string, enum: [upcoming, past] }
+        - { $ref: "#/components/parameters/limit" }
+        - { $ref: "#/components/parameters/cursor" }
+      responses:
+        "200":
+          description: Appointments
+          headers:
+            X-Next-Cursor: { $ref: "#/components/headers/NextCursor" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Appointment" }
+        "400":
+          description: Invalid filter, when, limit, or cursor
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: dealershipId outside the staff member's dealership
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+    post:
+      tags: [booking]
+      summary: Book appointment (idempotent per user)
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: |
+            Strongly recommended (the web client always sends one, kept until the chosen slot
+            changes). Scoped to the calling user; the same key from another user is independent.
+            Retrying with the same key and payload replays the booking (200, current state); the same
+            key with a different payload is 409. Without a key every request books anew, so a
+            retried request whose response was lost can create a second appointment (unless the
+            vehicle overlap rule refuses it with 409).
+          schema: { type: string, maxLength: 200 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BookRequest" }
+      responses:
+        "201":
+          description: Created
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Appointment" }
+        "200":
+          description: Idempotent replay (current state re-read from the database; `Location` names the same appointment)
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Appointment" }
+        "400":
+          description: |
+            Malformed request: invalid body or ids, an Idempotency-Key over 200 characters, or a `startAt` off the
+            30-minute slot grid
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Staff booking at a dealership outside their scope
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404":
+          description: |
+            Dealership, vehicle (or one not owned by the customer) or service type not found, or a
+            replayed key's appointment is no longer visible to the caller (e.g. a dispatcher since
+            moved to another dealership)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "409":
+          description: |
+            Conflict (resources taken concurrently, vehicle already booked at that time, idempotency
+            payload mismatch). When several rules fail at once only the first is reported: e.g. a
+            vehicle overlap (409) may be returned for a slot whose staging window is also full (422).
+            For a client, 409 and 422 both mean "this start cannot be booked: pick another one";
+            409 says another booking won the same resources while this request ran, 422 that they
+            were already taken (or the rules refuse the start) when it was read. A vehicle that
+            already has an overlapping appointment is always 409.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422":
+          description: |
+            Unavailable: an on-grid `startAt` the day does not offer (closure, closed weekday,
+            "start time is outside opening hours", lunch), in the past, inside the lead time or
+            past the horizon, no bay/technician on duty, or the staging window full
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments/{id}:
+    get:
+      tags: [booking]
+      summary: Get appointment (404 for another customer's)
+      parameters:
+        - { $ref: "#/components/parameters/appointmentId" }
+      responses:
+        "200":
+          description: Appointment
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Appointment" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments/{id}/cancel:
+    post:
+      tags: [booking]
+      summary: Cancel (releases bay/tech/vehicle)
+      description: |
+        Staff: from confirmed or checked_in. Customers: own confirmed booking, until the dealership's
+        change cutoff before start. Started or completed work cannot be cancelled. Retrying a cancel
+        is a no-op. Counts as a write for customer rate limiting.
+      parameters:
+        - { $ref: "#/components/parameters/appointmentId" }
+        - { $ref: "#/components/parameters/ifMatch" }
+      responses:
+        "200": { $ref: "#/components/responses/Appointment" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "422": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments/{id}/reschedule:
+    post:
+      tags: [booking]
+      summary: Move a confirmed appointment in place
+      description: |
+        Same appointment (id and number), new window: bay and technician are re-allocated for its
+        booked job lines and requirements (catalog edits since booking do not re-price it) in one
+        transaction, ignoring its own current hold (it may move into an overlapping slot); if the new
+        slot is not available nothing changes. Bumps
+        `version`. A retry with the same `startAt` (even with the now-stale If-Match) returns the
+        appointment unchanged; a stale If-Match for any other start is 412, so a late retry never
+        drags it back. Slot rules and error precedence are those of `POST /appointments`: 400 for a
+        `startAt` off the 30-minute grid, 422 for an on-grid start the day does not offer
+        ("start time is outside opening hours", closure, lunch, staging full, …), and only the first
+        failing rule is reported (a vehicle overlap 409 may come before a full staging window 422).
+        Changing only `isWaiter` (same `startAt`) keeps the window and is recorded as a reassign
+        (event 9), so the customer is not told the appointment moved. Counts as a write for
+        customer rate limiting.
+      parameters:
+        - { $ref: "#/components/parameters/appointmentId" }
+        - { $ref: "#/components/parameters/ifMatch" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RescheduleRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/Appointment" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments/{id}/check-in:
+    post:
+      tags: [workshop]
+      summary: confirmed → checked_in (staff; from the appointment day)
+      description: |
+        Allowed from the appointment's local day until its booked window ends; afterwards 422
+        (the bay and technician may already be sold to the next job: reschedule instead).
+      parameters:
+        - { $ref: "#/components/parameters/appointmentId" }
+        - { $ref: "#/components/parameters/ifMatch" }
+      responses:
+        "200": { $ref: "#/components/responses/Appointment" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments/{id}/start:
+    post:
+      tags: [workshop]
+      summary: checked_in → in_progress (staff)
+      description: |
+        Refused (409) while the technician or bay still has another job in progress. Starting before
+        the booked start (pull-ahead), or after the booked window has already ended, moves the
+        window to `[now, now + length)`; 409 if the technician, bay, or vehicle is booked in that
+        window. The car is already on site, so the moved window is not re-checked against staging,
+        lunch, or the technician roster.
+      parameters:
+        - { $ref: "#/components/parameters/appointmentId" }
+        - { $ref: "#/components/parameters/ifMatch" }
+      responses:
+        "200": { $ref: "#/components/responses/Appointment" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments/{id}/complete:
+    post:
+      tags: [workshop]
+      summary: in_progress → completed (staff; releases resources)
+      parameters:
+        - { $ref: "#/components/parameters/appointmentId" }
+        - { $ref: "#/components/parameters/ifMatch" }
+      responses:
+        "200": { $ref: "#/components/responses/Appointment" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments/{id}/no-show:
+    post:
+      tags: [workshop]
+      summary: confirmed → no_show (staff; after start time; releases resources)
+      description: A background sweeper also marks bookings not checked in within the dealership's `policy.noShowGraceMinutes` after start.
+      parameters:
+        - { $ref: "#/components/parameters/appointmentId" }
+        - { $ref: "#/components/parameters/ifMatch" }
+      responses:
+        "200": { $ref: "#/components/responses/Appointment" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments/{id}/reinstate:
+    post:
+      tags: [workshop]
+      summary: no_show → checked_in for a late arrival (staff; before the booked end)
+      description: |
+        Re-holds the booked bay and technician for the booked window. 409 if either (or the vehicle)
+        was re-booked after the no-show, or the technician is no longer active/qualified/on duty. 422
+        once the booked window has ended, when the day's calendar no longer admits the window (a
+        closure or closed weekday added since, opening hours that no longer cover it, or a lunch break
+        it now crosses — the calendar is re-checked because config changes only protect holding
+        appointments), or when the arrival window's staging area is full.
+      parameters:
+        - { $ref: "#/components/parameters/appointmentId" }
+        - { $ref: "#/components/parameters/ifMatch" }
+      responses:
+        "200": { $ref: "#/components/responses/Appointment" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments/{id}/extend:
+    post:
+      tags: [workshop]
+      summary: Extend an overrunning job (staff; checked_in or in_progress)
+      description: |
+        Moves `endAt` so the bay and technician stay held. 409 if the next booking already holds them;
+        422 if the appointment would span more than 24 hours. Checked-in work has not started, so the
+        part of the longer window still ahead of now is re-checked like a booking: 422 when the
+        technician is not on duty for it (shift end, break, absence) or it would pass closing time,
+        cross lunch, or fall on a closed day. In-progress (overrunning) work is only limited by the
+        next booking (409) and the 24h span. Clears `overrunAt` when the new end is ahead of now; an
+        extension that still ends in the past keeps the flag (and the hold on the bay and
+        technician). The maintenance sweeper also auto-extends in-progress work past its end in
+        `OVERRUN_EXTEND_STEP` steps (default 15m).
+        `minutes` is a delta, so If-Match is required (428 `precondition_required` without it, or
+        with `*`): a retry after a lost response then gets 412 instead of extending twice.
+      parameters:
+        - { $ref: "#/components/parameters/appointmentId" }
+        - { $ref: "#/components/parameters/ifMatchRequired" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [minutes]
+              properties:
+                minutes: { type: integer, minimum: 15, maximum: 240, multipleOf: 15 }
+      responses:
+        "200": { $ref: "#/components/responses/Appointment" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Error" }
+        "428": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments/{id}/reassign:
+    post:
+      tags: [workshop]
+      summary: Move work to another technician and/or bay in the same window (staff)
+      description: |
+        Confirmed or checked-in work only. The technician must be at the dealership, hold the booked
+        skills at the booked level, and be on duty for the part of the window still ahead of now (once
+        a late, checked-in job is past its booked end: on duty now) (422 otherwise); the bay must be an
+        active bay of the booked type at the dealership (express allowed for a short waiter job).
+        409 if the target already holds that window. A retry that is already in place is a no-op.
+      parameters:
+        - { $ref: "#/components/parameters/appointmentId" }
+        - { $ref: "#/components/parameters/ifMatch" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: At least one of the two.
+              properties:
+                technicianId: { type: string, format: uuid }
+                serviceBayId: { type: string, format: uuid }
+      responses:
+        "200": { $ref: "#/components/responses/Appointment" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /appointments/{id}/history:
+    get:
+      tags: [workshop]
+      summary: Audit trail of an appointment, oldest first (staff)
+      description: One page in the order the changes were recorded (see Pagination); a change recorded while you page shows on a later page.
+      parameters:
+        - { $ref: "#/components/parameters/appointmentId" }
+        - { $ref: "#/components/parameters/limit" }
+        - { $ref: "#/components/parameters/cursor" }
+      responses:
+        "200":
+          description: Changes
+          headers:
+            X-Next-Cursor: { $ref: "#/components/headers/NextCursor" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AppointmentChange" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/technicians:
+    get:
+      tags: [admin]
+      summary: List technicians, one page in name order (admin)
+      description: |
+        One page ordered by name, then id (see Pagination), inactive technicians included. A group
+        admin gets every dealership's, or `dealershipId`'s; a dealership admin only their own
+        (another `dealershipId` is 403).
+      parameters:
+        - name: dealershipId
+          in: query
+          schema: { type: string, format: uuid }
+        - { $ref: "#/components/parameters/limit" }
+        - { $ref: "#/components/parameters/cursor" }
+      responses:
+        "200":
+          description: Technicians
+          headers:
+            X-Next-Cursor: { $ref: "#/components/headers/NextCursor" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TechnicianAdmin" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+    post:
+      tags: [admin]
+      summary: Add a technician (emits CONFIG_UPDATED)
+      description: |
+        Adds an active technician with distinct skills at a level, working the dealership's opening
+        hours until a shift pattern is set (PUT .../shifts). A group admin anywhere, a dealership admin
+        at their own dealership.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewTechnician" }
+      responses:
+        "201":
+          description: Created
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TechnicianAdmin" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Not an admin, or an admin of another dealership
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { $ref: "#/components/responses/Busy" }
+  /admin/dealerships:
+    post:
+      tags: [admin]
+      summary: Open a new dealership (group admin only; emits CONFIG_UPDATED)
+      description: |
+        Creates a dealership with its default hours and lunch, staging cap, and self-service policy
+        (omitted policy fields take the defaults shown in Policy). Add bays and technicians next. A
+        dealership admin (scoped to one dealership) gets 403.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewDealership" }
+      responses:
+        "201":
+          description: Created
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dealership" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Not a group admin
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/dealerships/{id}:
+    patch:
+      tags: [admin]
+      summary: Patch dealership hours / lunch / staging / policy (emits CONFIG_UPDATED)
+      description: 409 if upcoming bookings would fall outside the new hours or overlap the new lunch; move them first.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - { $ref: "#/components/parameters/ifMatch" }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DealershipPatch" }
+      responses:
+        "200":
+          description: Updated
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dealership" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Not an admin, or an admin of another dealership
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/dealerships/{id}/bays:
+    post:
+      tags: [admin]
+      summary: Add a service bay (emits CONFIG_UPDATED for the dealership)
+      description: |
+        Adds an active bay; bumps the dealership's version (its capacity changed). A group admin
+        anywhere, a dealership admin at their own dealership. 409 if the dealership already has a bay
+        with that name.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewBay" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Bay" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Not an admin, or an admin of another dealership
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/dealerships/{id}/calendar:
+    get:
+      tags: [admin]
+      summary: Weekday hour overrides and upcoming closures (admin)
+      description: One object, not paged — bounded by design (7 weekday overrides, at most 366 upcoming closures).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { $ref: "#/components/responses/Calendar" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/dealerships/{id}/hours:
+    put:
+      tags: [admin]
+      summary: Replace weekday hour overrides (emits CONFIG_UPDATED)
+      description: |
+        Weekdays left out use the dealership default hours; `[]` clears every override. Bumps the
+        dealership version. 409 if an upcoming booking would fall outside the new hours or lunch.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - { $ref: "#/components/parameters/ifMatch" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [weekly]
+              properties:
+                weekly:
+                  type: array
+                  maxItems: 7
+                  items: { $ref: "#/components/schemas/WeekdayHours" }
+      responses:
+        "200": { $ref: "#/components/responses/Calendar" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/dealerships/{id}/closures:
+    post:
+      tags: [admin]
+      summary: Close the dealership for a whole local day (emits CONFIG_UPDATED)
+      description: 409 if already closed that day, upcoming bookings sit on it (move them first), or 366 closures are already upcoming (remove one first).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - { $ref: "#/components/parameters/ifMatch" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Closure" }
+      responses:
+        "201": { $ref: "#/components/responses/Calendar" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/dealerships/{id}/closures/{date}:
+    delete:
+      tags: [admin]
+      summary: Reopen a closed day (emits CONFIG_UPDATED)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: date
+          in: path
+          required: true
+          schema: { type: string, format: date }
+        - { $ref: "#/components/parameters/ifMatch" }
+      responses:
+        "200": { $ref: "#/components/responses/Calendar" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/service-types/{id}:
+    patch:
+      tags: [admin]
+      summary: Patch service duration / skill / bay (emits CONFIG_UPDATED)
+      description: |
+        Applies to new bookings only; existing appointments keep their window, bay, and technician.
+        400 if `durationMinutes` is longer than the longest uninterrupted opening window (open→lunch,
+        lunch→close, or open→close) of any open weekday at any dealership — it could never be booked.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - { $ref: "#/components/parameters/ifMatch" }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ServiceTypePatch" }
+      responses:
+        "200":
+          description: Updated
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServiceType" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Not an admin, or a dealership admin (the catalog is shared; group admins only)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/technicians/{id}:
+    patch:
+      tags: [admin]
+      summary: Patch technician skill level / active (emits CONFIG_UPDATED)
+      description: Deactivating a technician who still holds upcoming appointments, lowering their skill level below what an upcoming appointment needs, or removing a skill an upcoming appointment was booked with, returns 409.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - { $ref: "#/components/parameters/ifMatch" }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TechnicianPatch" }
+      responses:
+        "200":
+          description: Updated
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TechnicianAdmin" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/technicians/{id}/roster:
+    get:
+      tags: [admin]
+      summary: Weekly shifts and upcoming absences of a technician (admin)
+      description: One object, not paged — bounded by design (at most 7 weekly shifts and 100 absences not yet ended).
+      parameters:
+        - { $ref: "#/components/parameters/technicianId" }
+      responses:
+        "200": { $ref: "#/components/responses/Roster" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/technicians/{id}/shifts:
+    put:
+      tags: [admin]
+      summary: Replace the weekly shift pattern (emits CONFIG_UPDATED)
+      description: |
+        `[]` = works the dealership's opening hours. With a pattern, the technician works only the
+        listed weekdays, inside start–end, outside the break. Bumps the technician version. 409 if an
+        upcoming booking of the technician would fall outside the new pattern (reassign it first).
+      parameters:
+        - { $ref: "#/components/parameters/technicianId" }
+        - { $ref: "#/components/parameters/ifMatch" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [shifts]
+              properties:
+                shifts:
+                  type: array
+                  maxItems: 7
+                  items: { $ref: "#/components/schemas/TechnicianShift" }
+      responses:
+        "200": { $ref: "#/components/responses/Roster" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/technicians/{id}/absences:
+    post:
+      tags: [admin]
+      summary: Add an absence (leave, training; emits CONFIG_UPDATED)
+      description: At most 90 days. 409 if it overlaps another absence or an upcoming booking of the technician, or 100 absences have not ended yet (remove one first).
+      parameters:
+        - { $ref: "#/components/parameters/technicianId" }
+        - { $ref: "#/components/parameters/ifMatch" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [startsAt, endsAt]
+              properties:
+                startsAt: { type: string, format: date-time }
+                endsAt: { type: string, format: date-time }
+                reason: { type: string, maxLength: 120 }
+      responses:
+        "201": { $ref: "#/components/responses/Roster" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/technicians/{id}/absences/{absenceId}:
+    delete:
+      tags: [admin]
+      summary: Remove an absence (emits CONFIG_UPDATED)
+      parameters:
+        - { $ref: "#/components/parameters/technicianId" }
+        - name: absenceId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - { $ref: "#/components/parameters/ifMatch" }
+      responses:
+        "200": { $ref: "#/components/responses/Roster" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Stale" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/outbox/failed:
+    get:
+      tags: [admin]
+      summary: List failed (poisoned) outbox events, oldest first (group admin)
+      description: |
+        Events the worker stopped retrying after repeated content rejections from Kafka. A failed
+        event no longer blocks its aggregate, so it is lost to consumers until requeued. The payload
+        is not returned (it may carry customer PII). Only an admin with no dealership may call this;
+        a dealership-scoped admin gets 403. One page ordered by creation time, then id (see
+        Pagination); a requeued event leaves the list.
+      parameters:
+        - { $ref: "#/components/parameters/limit" }
+        - { $ref: "#/components/parameters/cursor" }
+      responses:
+        "200":
+          description: Failed events
+          headers:
+            X-Next-Cursor: { $ref: "#/components/headers/NextCursor" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/FailedOutboxEvent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /admin/outbox/requeue:
+    post:
+      tags: [admin]
+      summary: Return failed outbox events to pending (group admin)
+      description: |
+        For use once the cause is fixed (a broker limit raised, a payload repaired). Rejections are
+        reset and the worker publishes the events again; ids that are not `failed` (already
+        requeued, published, unknown) are ignored and not counted. A failed event whose aggregate
+        has another event being published right now stays failed and is returned in `skipped`
+        (requeuing it would put two events of one aggregate in flight); call again shortly. A
+        requeued event keeps its `seq`,
+        so it still precedes unpublished newer events of its aggregate, but it may reach consumers
+        after newer events that were already published; consumers ignore stale versions. Only an
+        admin with no dealership may call this; a dealership-scoped admin gets 403.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              additionalProperties: false
+              properties:
+                ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { type: string, format: uuid }
+      responses:
+        "200":
+          description: How many events moved back to pending, and which were skipped
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requeued, skipped]
+                properties:
+                  requeued: { type: integer, minimum: 0 }
+                  skipped:
+                    type: array
+                    description: Failed ids left as they are because their aggregate has an event in flight
+                    items: { type: string, format: uuid }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+  /ws/dispatch:
+    get:
+      tags: [realtime]
+      summary: WebSocket — per-audience event fan-out
+      security: []
+      parameters:
+        - name: ticket
+          in: query
+          required: false
+          description: "Ticket from `POST /auth/ws-ticket` (required for customers). Staff service clients may send `Authorization: Bearer <token>` instead; a customer's Bearer token is 403."
+          schema: { type: string }
+        - name: dealershipId
+          in: query
+          required: false
+          description: 'Initial event filter. Change it later by sending `{"type":"subscribe","dealershipId":"<uuid or empty>"}`.'
+          schema: { type: string, format: uuid }
+      description: |
+        Messages are `{type, instanceId, payload}`; `type` is an event type code (integer, see the
+        enums above), named below. Delivery is at-least-once and may be out of order across
+        instances: compare `payload.version` and refetch on reconnect.
+
+        Who receives what:
+        - **Staff:** `APPOINTMENT_*` for the subscribed dealership (all if none), payload
+          `AppointmentNotice`; dealership-scoped staff never receive other dealerships' events.
+        - **Owning customer:** `APPOINTMENT_*` for their own bookings, at any dealership whatever
+          the subscription.
+        - **Other customers:** `AVAILABILITY_CHANGED` (payload `AvailabilityNotice`, no identity) for
+          events that change capacity, and — without a window — for a technician change, at the
+          subscribed dealership (all if none).
+        - **Everyone:** `CONFIG_UPDATED` (payload `ConfigNotice`) for a dealership or service type,
+          whatever the subscription (the public catalog) — reload the catalog; dealership-scoped
+          staff get only their own dealership's. `entity: 4` (technician: skills, shifts, absences)
+          goes to staff only, filtered like `APPOINTMENT_*`; customers get the window-less
+          `AVAILABILITY_CHANGED` above instead.
+
+        Event types (codes): 15 `CONNECTED` (first frame), 1 `APPOINTMENT_CREATED`, 3
+        `APPOINTMENT_CANCELLED`, 2 `APPOINTMENT_RESCHEDULED`, 4 `APPOINTMENT_CHECKED_IN`, 5
+        `APPOINTMENT_STARTED`, 6 `APPOINTMENT_COMPLETED`, 7 `APPOINTMENT_NO_SHOW`, 10
+        `APPOINTMENT_EXTENDED`, 8 `APPOINTMENT_REINSTATED`, 9 `APPOINTMENT_REASSIGNED`, 11
+        `APPOINTMENT_OVERRUNNING` (in-progress work past its end that could not be auto-extended;
+        staff and owner only), 14 `AVAILABILITY_CHANGED`, 13 `CONFIG_UPDATED`. The socket closes with 1008 when the login session
+        ends (its absolute end, `sexp` / `sessionExpiresAt`, not the access token's expiry), when the user logs out anywhere (`POST /auth/logout`), or when the account is
+        disabled or its role or dealership changes (each instance re-checks all its sockets in one
+        sweep about once per ping period, with jitter, so this can take up to about a minute).
+
+        Each instance holds at most 10 sockets per user. Over the cap the upgrade is refused with
+        429 and `Retry-After` (a browser only sees a failed connection, close code 1006); two
+        opens racing for the last place may instead be upgraded and then closed with 1013 (try
+        again later). Clients should back off for at least the `Retry-After` (30 s) and grow the
+        delay while connections keep failing before the `CONNECTED` frame.
+      responses:
+        "101":
+          description: Switching Protocols
+        "400":
+          description: Invalid dealershipId
+        "401":
+          description: Missing or invalid ticket/token
+        "403":
+          description: Bearer token of a non-staff user (customers must use a ticket)
+        "429":
+          description: This user already holds the maximum number of sockets on this instance
+          headers:
+            Retry-After: { schema: { type: integer, example: 30 } }
+        "500":
+          description: Unexpected failure while checking the session (error code `internal`, no detail)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "503": { $ref: "#/components/responses/Busy" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-uss_refresh
+      description: Opaque, rotating refresh token set by login/register/refresh (HttpOnly). Named `uss_refresh` (Path=/api/v1/auth) when `AUTH_COOKIE_SECURE=false`.
+
+  headers:
+    RefreshCookie:
+      description: |
+        `__Host-uss_refresh=<opaque token>; Path=/; Max-Age=<seconds until the token's idle expiry,
+        capped at the session's end>; HttpOnly; Secure; SameSite=Strict` (no `Domain`). With
+        `AUTH_COOKIE_SECURE=false` (a plain-http local stack only):
+        `uss_refresh=<token>; Path=/api/v1/auth; Max-Age=…; HttpOnly; SameSite=Strict`.
+      schema: { type: string }
+    ClearRefreshCookie:
+      description: "`__Host-uss_refresh=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict` (or `uss_refresh=; Path=/api/v1/auth; Max-Age=0; HttpOnly; SameSite=Strict` with `AUTH_COOKIE_SECURE=false`): clears the cookie."
+      schema: { type: string }
+    ETag:
+      description: Quoted row version, e.g. `"3"`. Send back as If-Match.
+      schema: { type: string }
+    CatalogETag:
+      description: Content hash of the page (body and next cursor), e.g. `"c-1f2e…"` (not a row version). Send back as If-None-Match.
+      schema: { type: string }
+    NextCursor:
+      description: Opaque token for the next page (pass it back as `cursor` with the same filters); absent on the last page. See Pagination.
+      schema: { type: string }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Stale:
+      description: If-Match does not match the current version (someone else changed it)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Ready:
+      description: Readiness (`ok`, `degraded` = Redis down or request pool saturated, `unavailable` = Postgres down → 503)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              status: { type: string, enum: [ok, degraded, unavailable] }
+              instance: { type: string }
+              checks:
+                type: object
+                properties:
+                  postgres: { type: string, enum: [ok, down] }
+                  redis: { type: string, enum: [ok, down] }
+                  pool: { type: string, enum: [ok, saturated] }
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Appointment:
+      description: Appointment after the change
+      headers:
+        ETag: { $ref: "#/components/headers/ETag" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Appointment" }
+    CrossOrigin:
+      description: |
+        Refused as cross-site (error code `forbidden`): `Sec-Fetch-Site: cross-site`, an `Origin`
+        other than the request's own or `ALLOWED_ORIGINS`, or (cookie requests) no
+        `X-Requested-With: fetch`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: Missing, invalid, or expired token; the session was signed out; or the account is disabled
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    TooLarge:
+      description: Request body over 1 MiB (error code `too_large`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotModified:
+      description: The `If-None-Match` tag still matches; reuse the cached body
+      headers:
+        ETag: { $ref: "#/components/headers/CatalogETag" }
+    Busy:
+      description: A database wait timed out (a lock behind an admin change, a slow statement, or the request deadline `REQUEST_TIMEOUT`); retry shortly
+      headers:
+        Retry-After: { schema: { type: integer, example: 1 } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Roster:
+      description: Technician roster after the change
+      headers:
+        ETag: { $ref: "#/components/headers/ETag" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/TechnicianRoster" }
+    Calendar:
+      description: Dealership calendar after the change
+      headers:
+        ETag: { $ref: "#/components/headers/ETag" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/DealershipCalendar" }
+
+  parameters:
+    limit:
+      name: limit
+      in: query
+      description: Page size (see Pagination).
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    cursor:
+      name: cursor
+      in: query
+      description: The previous page's `X-Next-Cursor`, with the same filters; omit for the first page. Another list's or other filters' token is 400.
+      schema: { type: string, maxLength: 2048 }
+    dealershipId:
+      name: dealershipId
+      in: query
+      required: true
+      schema: { type: string, format: uuid }
+    vehicleId:
+      name: vehicleId
+      in: query
+      required: true
+      schema: { type: string, format: uuid }
+    serviceTypeId:
+      name: serviceTypeId
+      in: query
+      description: One job line (or send serviceTypeIds).
+      schema: { type: string, format: uuid }
+    serviceTypeIds:
+      name: serviceTypeIds
+      in: query
+      description: Several job lines, comma separated, 1–5, in line order (or send serviceTypeId).
+      schema: { type: string }
+      explode: false
+    excludeAppointmentId:
+      name: excludeAppointmentId
+      in: query
+      description: |
+        Reschedule view: the appointment being moved. Its own hold (bay, technician, vehicle,
+        staging arrival) is ignored, exactly as `POST /appointments/{id}/reschedule` does, so it
+        can slide into an overlapping slot. Must be an appointment of `vehicleId` at `dealershipId`
+        (400 otherwise) that the caller can see (404 otherwise), and one the reschedule would accept:
+        confirmed (409 otherwise) and, for a customer, before the online change cutoff (422). The
+        slots are computed for its booked snapshot (labour time, bay type, skills, level), as the
+        reschedule moves it, never for the catalog as edited since; `serviceTypeId(s)` must name
+        its booked job lines, in order (400 otherwise).
+      schema: { type: string, format: uuid }
+    technicianId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    appointmentId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ifMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: Strong version from ETag, exactly one quoted value (`"3"`). Omit or `*` to skip the check; bare (`3`), weak (`W/"3"`), malformed or list values are 400.
+      schema: { type: string }
+    ifMatchRequired:
+      name: If-Match
+      in: header
+      required: true
+      description: Strong version from ETag, exactly one quoted value (`"3"`). Missing or `*` is 428; bare, weak, malformed or list values are 400.
+      schema: { type: string }
+    cacheControlRequest:
+      name: Cache-Control
+      in: header
+      required: false
+      description: "`no-cache` (or `max-age=0`) reads through the instance's catalog cache and refreshes it, unless the cached body was loaded less than 0.5 s ago (concurrent reloads share one query)."
+      schema: { type: string, example: no-cache }
+    ifNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: The `ETag` of a previous response; 304 while the list is unchanged.
+      schema: { type: string }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              enum: [invalid, not_found, conflict, unavailable, unauthorized, forbidden, precondition_failed, precondition_required, rate_limited, busy, too_large, internal]
+            message: { type: string }
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+
+    RegisterRequest:
+      type: object
+      required: [email, password, name]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, minLength: 8, maxLength: 72 }
+        name: { type: string, maxLength: 120 }
+
+    AuthResponse:
+      type: object
+      required: [token, expiresAt, sessionExpiresAt, user]
+      properties:
+        token:
+          type: string
+          description: Access token (JWT, aud `api`; claims include `sid` and `sexp`). Keep it in memory only.
+        expiresAt:
+          type: string
+          format: date-time
+          description: Access token expiry (`ACCESS_TOKEN_TTL` after issue, never after `sessionExpiresAt`). Refresh before it.
+        sessionExpiresAt:
+          type: string
+          format: date-time
+          description: The login session's absolute end (`SESSION_MAX_TTL` after login); no refresh extends it.
+        user: { $ref: "#/components/schemas/User" }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string }
+        name: { type: string }
+        role:
+          type: integer
+          description: "1=admin 2=dispatcher 3=customer"
+          enum: [1, 2, 3]
+        customerId:
+          type: string
+          format: uuid
+          description: Present for customers only.
+        dealershipId:
+          type: string
+          format: uuid
+          description: Staff home dealership; absent for customers and group-wide admins.
+
+    Dealership:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        timezone: { type: string }
+        openTime: { type: string, example: "08:00" }
+        closeTime: { type: string, example: "17:00" }
+        lunchStart: { type: string, example: "12:00" }
+        lunchEnd: { type: string, example: "13:00" }
+        stagingCapacity: { type: integer, description: "Arrivals per staging window; 0 = unlimited" }
+        stagingWindowMinutes: { type: integer, enum: [15, 30, 60] }
+        policy: { $ref: "#/components/schemas/Policy" }
+        today: { type: string, format: date }
+        version: { type: integer }
+
+    Policy:
+      type: object
+      description: The dealership's self-service and workshop rules.
+      properties:
+        customerLeadMinutes: { type: integer, minimum: 0, maximum: 10080, description: "Online booking notice" }
+        customerChangeCutoffMinutes: { type: integer, minimum: 0, maximum: 10080, description: "Online cancel/reschedule closes this long before start" }
+        bookingHorizonDays: { type: integer, minimum: 1, maximum: 365, description: "Customers book at most this far ahead" }
+        noShowGraceMinutes: { type: integer, minimum: 5, maximum: 240 }
+        expressMaxMinutes: { type: integer, minimum: 0, maximum: 600, description: "Waiters soft-upgrade general work to express only up to this length; 0 = never" }
+
+    ServiceType:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        name: { type: string }
+        durationMinutes: { type: integer }
+        requiredSkill: { type: integer, description: "1=lubrication 2=brakes 3=general" }
+        requiredBayType: { type: integer, description: "1=express 2=general 3=diagnostic 4=alignment" }
+        minSkillLevel: { type: integer, minimum: 1, maximum: 4 }
+        version: { type: integer }
+
+    Vehicle:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        customerId: { type: string, format: uuid }
+        customerName: { type: string }
+        vin: { type: string }
+        make: { type: string }
+        model: { type: string }
+        year: { type: integer }
+
+    Customer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        phone: { type: string, description: "\"\" = none" }
+        email: { type: string, description: "\"\" = none" }
+
+    CustomerCreate:
+      type: object
+      required: [name]
+      description: At least one of phone and email.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        phone: { type: string, maxLength: 30, description: "At least 6 digits; digits, spaces and + - ( ) . only" }
+        email: { type: string, maxLength: 254, format: email, description: "Stored lowercased" }
+
+    VehicleCreate:
+      type: object
+      required: [vin, make, model, year]
+      properties:
+        customerId: { type: string, format: uuid, description: "Staff only; required for staff" }
+        vin: { type: string, minLength: 17, maxLength: 17, description: "ISO 3779 (no I, O, Q)" }
+        make: { type: string, maxLength: 60 }
+        model: { type: string, maxLength: 60 }
+        year: { type: integer, minimum: 1980 }
+
+    Slot:
+      type: object
+      properties:
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        available:
+          type: boolean
+          description: |
+            Bookable now. Includes starts that need one repair move: when no fitting bay (or no
+            qualified on-duty technician) is free, the booking may move one other confirmed, not yet
+            started appointment to another bay (technician) that fits it, in the same window (its
+            customer sees no change; it gets an APPOINTMENT_REASSIGNED event), at most one move per
+            missing resource.
+        freeBays:
+          type: integer
+          description: Fitting bays free without any move; may be 0 on an available slot (bookable by one repair move)
+        freeTechnicians:
+          type: integer
+          description: Qualified on-duty technicians free without any move; may be 0 on an available slot (bookable by one repair move)
+        reason:
+          type: string
+          enum: [past, lead_time, beyond_horizon, lunch_break, vehicle_busy, staging_full, no_bay, no_technician, no_resources]
+        recommended:
+          type: boolean
+          description: |
+            A hint to steer customers by (false on every slot that is not available). Booking this
+            start leaves no new idle gap on the bay and the technician the engine would book it on
+            (its own best-fit pick, the same order the booking uses): on each, it butts against a
+            booking or an edge of the bookable stretch (opening, lunch, closing; for a technician also
+            their shift's start, end, and break) on at least one side. Starts in the middle of a free stretch
+            split it into pieces a later long job may not fit. Never set on a slot bookable only by a
+            repair move (freeBays or freeTechnicians 0).
+
+    Availability:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        timezone: { type: string }
+        durationMinutes: { type: integer }
+        closed: { type: boolean, description: "Closed that day (weekday closing day or closure); slots is empty" }
+        closedReason: { type: string }
+        reason:
+          type: string
+          enum: [day_too_short]
+          description: Why an open day offers no start at all (`day_too_short` — its hours are shorter than the job); slots is empty
+        slots:
+          type: array
+          items: { $ref: "#/components/schemas/Slot" }
+
+    BookRequest:
+      type: object
+      description: Send `serviceTypeId` (one job line) or `serviceTypeIds` (1–5, in line order), not both.
+      required: [dealershipId, vehicleId, startAt]
+      oneOf:
+        - required: [serviceTypeId]
+        - required: [serviceTypeIds]
+      properties:
+        dealershipId: { type: string, format: uuid }
+        vehicleId: { type: string, format: uuid }
+        serviceTypeId: { type: string, format: uuid }
+        serviceTypeIds:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items: { type: string, format: uuid }
+        startAt: { type: string, format: date-time }
+        isWaiter: { type: boolean, default: false }
+
+    RescheduleRequest:
+      type: object
+      required: [startAt]
+      properties:
+        startAt: { type: string, format: date-time }
+        isWaiter: { type: boolean, description: "Omit to keep the current value" }
+
+    Appointment:
+      type: object
+      required: [id, dealershipId, dealershipName, customerId, customerName, vehicleId, vehicleLabel, vin,
+        serviceTypeId, serviceName, durationMinutes, lines, requiredBayType, requiredSkills, minSkillLevel,
+        serviceBayId, serviceBayName, serviceBayType, technicianId, technicianName, startAt, endAt, status,
+        isWaiter, version]
+      properties:
+        id: { type: string, format: uuid }
+        dealershipId: { type: string, format: uuid }
+        dealershipName: { type: string }
+        customerId: { type: string, format: uuid }
+        customerName: { type: string }
+        vehicleId: { type: string, format: uuid }
+        vehicleLabel: { type: string }
+        vin: { type: string }
+        serviceTypeId: { type: string, format: uuid, description: "Primary (first) job line" }
+        serviceName: { type: string, description: "Every line, joined with \" + \"" }
+        durationMinutes: { type: integer, description: "Booked labour time (sum of lines), not the catalog's current value" }
+        lines:
+          type: array
+          items: { $ref: "#/components/schemas/AppointmentLine" }
+        requiredBayType: { type: integer, enum: [1, 2, 3, 4], description: "Booked requirement: bay type that fits every line (1=express 2=general 3=diagnostic 4=alignment)" }
+        requiredSkills:
+          type: array
+          items: { type: integer, enum: [1, 2, 3], description: "1=lubrication 2=brakes 3=general" }
+        minSkillLevel: { type: integer, minimum: 1, maximum: 4 }
+        serviceBayId: { type: string, format: uuid }
+        serviceBayName: { type: string }
+        serviceBayType: { type: integer, enum: [1, 2, 3, 4] }
+        technicianId: { type: string, format: uuid }
+        technicianName: { type: string }
+        startAt: { type: string, format: date-time }
+        endAt: { type: string, format: date-time }
+        status:
+          type: integer
+          description: "1=confirmed 2=checked_in 3=in_progress 4=completed 5=cancelled 6=no_show"
+          enum: [1, 2, 3, 4, 5, 6]
+        isWaiter: { type: boolean }
+        version: { type: integer }
+        checkedInAt: { type: string, format: date-time }
+        startedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time }
+        overrunAt: { type: string, format: date-time, description: "In-progress work ran past its end and could not be auto-extended" }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AppointmentNotice:
+      type: object
+      description: WebSocket payload for staff and the owning customer (no personal data).
+      properties:
+        id: { type: string, format: uuid }
+        dealershipId: { type: string, format: uuid }
+        status: { type: integer }
+        version: { type: integer }
+        startAt: { type: string, format: date-time }
+        endAt: { type: string, format: date-time }
+
+    AppointmentLine:
+      type: object
+      properties:
+        lineNo: { type: integer }
+        serviceTypeId: { type: string, format: uuid }
+        code: { type: string }
+        name: { type: string }
+        durationMinutes: { type: integer }
+
+    AppointmentChange:
+      type: object
+      description: One audit-trail entry; every change bumps the appointment version.
+      properties:
+        version: { type: integer }
+        eventType: { type: integer, minimum: 1, maximum: 11, example: 9, description: "1=APPOINTMENT_CREATED 2=APPOINTMENT_RESCHEDULED 3=APPOINTMENT_CANCELLED 4=APPOINTMENT_CHECKED_IN 5=APPOINTMENT_STARTED 6=APPOINTMENT_COMPLETED 7=APPOINTMENT_NO_SHOW 8=APPOINTMENT_REINSTATED 9=APPOINTMENT_REASSIGNED 10=APPOINTMENT_EXTENDED 11=APPOINTMENT_OVERRUNNING" }
+        actorId: { type: string, format: uuid, description: "Absent for system changes (sweepers)" }
+        at: { type: string, format: date-time }
+        status: { type: integer }
+        startAt: { type: string, format: date-time }
+        endAt: { type: string, format: date-time }
+        serviceBayId: { type: string, format: uuid }
+        technicianId: { type: string, format: uuid }
+
+    NextAvailability:
+      type: object
+      properties:
+        timezone: { type: string }
+        durationMinutes: { type: integer }
+        searchedFrom: { type: string, format: date }
+        searchedTo: { type: string, format: date }
+        slots:
+          type: array
+          items:
+            type: object
+            properties:
+              date: { type: string, format: date }
+              start: { type: string, format: date-time }
+              end: { type: string, format: date-time }
+              freeBays: { type: integer }
+              freeTechnicians: { type: integer }
+              recommended: { type: boolean, description: "As on the day's Slot: booking this start leaves no new idle gap" }
+
+    AvailabilityNotice:
+      type: object
+      description: |
+        WebSocket payload for other customers — capacity changed at this dealership. The window is
+        the appointment's new one; a move (reschedule, early start) also frees its old window, so
+        refresh the dealership's availability rather than only slots overlapping this window. A
+        technician change (roster, skills) has no window (`startAt`/`endAt` absent): it may change
+        any day, so refresh every view of that dealership (day grid and first-available list).
+      required: [dealershipId]
+      properties:
+        dealershipId: { type: string, format: uuid }
+        startAt: { type: string, format: date-time, description: "Absent for a technician change" }
+        endAt: { type: string, format: date-time, description: "Absent for a technician change" }
+
+    ConfigNotice:
+      type: object
+      properties:
+        entity: { type: integer, enum: [2, 3, 4], description: "Aggregate type: 2=dealership 3=service_type 4=technician" }
+        id: { type: string, format: uuid }
+        version: { type: integer }
+
+    Bay:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        bayType: { type: integer }
+
+    Schedule:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        timezone: { type: string }
+        openTime: { type: string, description: "That day's hours (defaults when closed)" }
+        closeTime: { type: string }
+        lunchStart: { type: string, description: "That day's lunch, HH:MM (absent when closed or no lunch)" }
+        lunchEnd: { type: string }
+        closed: { type: boolean }
+        closedReason: { type: string }
+        bays:
+          type: array
+          items: { $ref: "#/components/schemas/Bay" }
+        technicians:
+          type: array
+          description: Active technicians of the dealership (reassign targets)
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              name: { type: string }
+              skillLevel: { type: integer, minimum: 1, maximum: 4 }
+              skills:
+                type: array
+                items: { type: integer }
+        appointments:
+          type: array
+          items: { $ref: "#/components/schemas/Appointment" }
+
+    FailedOutboxEvent:
+      type: object
+      required: [id, seq, aggregateType, aggregateId, eventType, attempts, rejections, lastError, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        seq: { type: integer, format: int64, description: Commit order within the aggregate }
+        aggregateType: { type: integer, minimum: 1, maximum: 5, example: 1, description: "1=appointment 2=dealership 3=service_type 4=technician 5=user" }
+        aggregateId: { type: string, format: uuid }
+        eventType: { type: integer, minimum: 1, maximum: 13, example: 1, description: "1=APPOINTMENT_CREATED 2=APPOINTMENT_RESCHEDULED 3=APPOINTMENT_CANCELLED 4=APPOINTMENT_CHECKED_IN 5=APPOINTMENT_STARTED 6=APPOINTMENT_COMPLETED 7=APPOINTMENT_NO_SHOW 8=APPOINTMENT_REINSTATED 9=APPOINTMENT_REASSIGNED 10=APPOINTMENT_EXTENDED 11=APPOINTMENT_OVERRUNNING 12=SESSION_REVOKED 13=CONFIG_UPDATED" }
+        attempts: { type: integer }
+        rejections: { type: integer, description: Content rejections counted before it was marked failed }
+        lastError: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    TechnicianAdmin:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        dealershipId: { type: string, format: uuid }
+        name: { type: string }
+        skillLevel: { type: integer, minimum: 1, maximum: 4 }
+        active: { type: boolean }
+        version: { type: integer }
+        skills:
+          type: array
+          items: { type: integer }
+
+    NewDealership:
+      type: object
+      required: [name, timezone, openTime, closeTime]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        timezone: { type: string, example: Europe/London, description: IANA zone name }
+        openTime: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+        closeTime: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+        lunchStart: { type: string, description: "HH:MM; send with lunchEnd, or omit both" }
+        lunchEnd: { type: string }
+        stagingCapacity: { type: integer, minimum: 0, maximum: 100, default: 0, description: 0 = unlimited }
+        stagingWindowMinutes: { type: integer, enum: [15, 30, 60], default: 60 }
+        policy:
+          type: object
+          description: Any subset of Policy fields (the rest take the defaults).
+          properties:
+            customerLeadMinutes: { type: integer, minimum: 0, maximum: 10080, default: 60 }
+            customerChangeCutoffMinutes: { type: integer, minimum: 0, maximum: 10080, default: 60 }
+            bookingHorizonDays: { type: integer, minimum: 1, maximum: 365, default: 90 }
+            noShowGraceMinutes: { type: integer, minimum: 5, maximum: 240, default: 30 }
+            expressMaxMinutes: { type: integer, minimum: 0, maximum: 600, default: 60 }
+
+    NewBay:
+      type: object
+      required: [name, bayType]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        bayType: { type: integer, enum: [1, 2, 3, 4], description: "1 express, 2 general, 3 diagnostic, 4 alignment" }
+
+    NewTechnician:
+      type: object
+      required: [dealershipId, name, skillLevel, skills]
+      properties:
+        dealershipId: { type: string, format: uuid }
+        name: { type: string, minLength: 1, maxLength: 100 }
+        skillLevel: { type: integer, minimum: 1, maximum: 4 }
+        skills:
+          type: array
+          minItems: 1
+          items: { type: integer, enum: [1, 2, 3], description: "1 lubrication, 2 brakes, 3 general" }
+
+    DealershipPatch:
+      type: object
+      description: Omitted fields keep their value. lunchStart/lunchEnd go together; both "" clears lunch.
+      properties:
+        openTime: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+        closeTime: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+        lunchStart: { type: string }
+        lunchEnd: { type: string }
+        stagingCapacity: { type: integer, minimum: 0, maximum: 100 }
+        stagingWindowMinutes: { type: integer, enum: [15, 30, 60] }
+        policy:
+          type: object
+          description: Any subset of Policy fields.
+          properties:
+            customerLeadMinutes: { type: integer, minimum: 0, maximum: 10080 }
+            customerChangeCutoffMinutes: { type: integer, minimum: 0, maximum: 10080 }
+            bookingHorizonDays: { type: integer, minimum: 1, maximum: 365 }
+            noShowGraceMinutes: { type: integer, minimum: 5, maximum: 240 }
+            expressMaxMinutes: { type: integer, minimum: 0, maximum: 600 }
+
+    ServiceTypePatch:
+      type: object
+      properties:
+        durationMinutes: { type: integer, minimum: 30, maximum: 600, multipleOf: 30 }
+        minSkillLevel: { type: integer, minimum: 1, maximum: 4 }
+        requiredSkill: { type: integer, minimum: 1, maximum: 3 }
+        requiredBayType: { type: integer, minimum: 1, maximum: 4 }
+
+    WeekdayHours:
+      type: object
+      description: Overrides the default hours on one ISO weekday. Closed days carry no times.
+      required: [weekday, closed]
+      properties:
+        weekday: { type: integer, minimum: 1, maximum: 7, description: "1=Monday … 7=Sunday" }
+        closed: { type: boolean }
+        openTime: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+        closeTime: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+        lunchStart: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+        lunchEnd: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+
+    Closure:
+      type: object
+      required: [date]
+      properties:
+        date: { type: string, format: date, description: "Dealership local day" }
+        reason: { type: string, maxLength: 120 }
+
+    DealershipCalendar:
+      type: object
+      properties:
+        dealershipId: { type: string, format: uuid }
+        version: { type: integer, description: "Dealership row version (If-Match)" }
+        weekly:
+          type: array
+          items: { $ref: "#/components/schemas/WeekdayHours" }
+        closures:
+          type: array
+          items: { $ref: "#/components/schemas/Closure" }
+
+    TechnicianPatch:
+      type: object
+      properties:
+        skillLevel: { type: integer, minimum: 1, maximum: 4 }
+        active: { type: boolean }
+        skills:
+          type: array
+          minItems: 1
+          description: >-
+            The full skill set (1 lubrication, 2 brakes, 3 general; duplicates dropped). Removing a
+            skill an appointment not yet ended was booked with is 409.
+          items: { type: integer, minimum: 1, maximum: 3 }
+
+    TechnicianShift:
+      type: object
+      required: [weekday, startTime, endTime]
+      properties:
+        weekday: { type: integer, minimum: 1, maximum: 7, description: "1=Monday … 7=Sunday" }
+        startTime: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+        endTime: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+        breakStart: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+        breakEnd: { type: string, pattern: "^\\d{2}:\\d{2}$" }
+
+    TechnicianAbsence:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        startsAt: { type: string, format: date-time }
+        endsAt: { type: string, format: date-time }
+        reason: { type: string }
+
+    TechnicianRoster:
+      type: object
+      properties:
+        technicianId: { type: string, format: uuid }
+        version: { type: integer, description: "Technician row version (If-Match)" }
+        shifts:
+          type: array
+          description: Empty = works the dealership's opening hours
+          items: { $ref: "#/components/schemas/TechnicianShift" }
+        absences:
+          type: array
+          description: Upcoming (not yet ended)
+          items: { $ref: "#/components/schemas/TechnicianAbsence" }

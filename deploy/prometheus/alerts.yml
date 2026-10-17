@@ -1,0 +1,99 @@
+# Alert rules for the scheduler. Queue depths come from scheduler_queue_rows (scraped per backend;
+# every backend reports the same shared Postgres numbers, hence max by).
+groups:
+  - name: scheduler
+    rules:
+      # Any scrape target (a backend, or Prometheus itself) that stopped answering /metrics.
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.job }} target {{ $labels.instance }} is down (scrape failing)"
+
+      # From each backend's readiness probe (scheduler_dependency_up, refreshed at scrape time).
+      - alert: PostgresUnreachable
+        expr: max by (instance_id) (scheduler_dependency_up{dep="postgres"}) == 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.instance_id }} cannot reach Postgres; it reports not ready and serves 503s"
+
+      # Redis is fail-open, so nothing errors: login/register limits drop to per-instance counters,
+      # every other rate limit is off, idempotency replays go to Postgres, and WS tickets are reusable
+      # until they expire (60 s).
+      - alert: RedisUnreachable
+        expr: max by (instance_id) (scheduler_dependency_up{dep="redis"}) == 0
+        for: 1m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.instance_id }} cannot reach Redis; rate limits are per instance or off until it is back"
+
+      - alert: OutboxPoisonedEvents
+        expr: max by (queue) (scheduler_queue_rows{queue="outbox", status="failed"}) > 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: Outbox events were rejected by Kafka too often and are parked as failed
+          description: List them with GET /api/v1/admin/outbox/failed (lastError), fix the cause, then requeue with POST /api/v1/admin/outbox/requeue (group admin).
+
+      - alert: StaleOverrun
+        expr: max(scheduler_queue_rows{queue="workshop", status="stale_overrun"}) > 0
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: An overrunning job has been open for over 12 hours
+          description: A flagged overrun holds its bay and technician until it is completed, so a job left open blocks them on every later day. Complete it on the day board (or extend it if the car is really still there).
+
+      - alert: OutboxBacklog
+        expr: max by (queue) (scheduler_queue_rows{queue="outbox", status="pending"}) > 200
+        for: 2m
+        labels: { severity: warn }
+        annotations:
+          summary: Outbox is not draining (Kafka down or workers stuck); live boards are stale
+
+      - alert: NotificationsFailing
+        expr: max by (queue) (scheduler_queue_rows{queue="notifications", status="failed"}) > 0
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: Customer notifications exhausted their retries (gateway down or bad recipient)
+
+      - alert: NotificationBacklog
+        expr: max by (queue) (scheduler_queue_rows{queue="notifications", status="pending"}) > 500
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: Customer notifications are queueing up
+
+      # result="canceled" (client went away, HTTP 499) and "busy" (503) are not server errors.
+      - alert: BookingServerErrors
+        expr: sum(rate(scheduler_bookings_total{result="internal"}[5m])) > 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: Bookings are failing with 500s
+
+      # Any other 5xx (500 internal on any route, 502/504 from a handler): unexpected failures
+      # the booking alert above does not see. 503 is the database-busy signal (DatabaseBusy below);
+      # 499 (client went away) is not a 5xx. Gateway-generated 502/504 never reach this counter
+      # (TargetDown covers a dead backend).
+      - alert: HTTPServerErrors
+        expr: sum by (route) (rate(scheduler_http_requests_total{status=~"5..", status!="503"}[5m])) > 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.route }} is answering 5xx (not 503 busy); see the 'request failed' logs"
+
+      - alert: EventsSkipped
+        expr: sum(increase(scheduler_events_skipped_total[15m])) > 0
+        labels: { severity: page }
+        annotations:
+          summary: A Kafka event was skipped after repeated handler panics (lost to its consumer; see "skipping event" logs)
+
+      - alert: DatabaseBusy
+        expr: sum(rate(scheduler_http_requests_total{status="503"}[5m])) > 1
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: Requests keep timing out on the database (lock/statement timeouts or REQUEST_TIMEOUT; long admin transactions, contention, or an exhausted pool)

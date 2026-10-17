@@ -1,0 +1,71 @@
+# golangci-lint v2 — single entrypoint for local + CI (Go 1.27).
+# Enable only what we agreed: no standalone staticcheck/gosec/go-critic.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - gosec
+    - modernize
+    - unused
+    # Resource / context hygiene.
+    - bodyclose     # http.Response bodies (clients, httptest, WS dial responses)
+    - rowserrcheck  # pgx.Rows.Err after a Next loop (packages below; database/sql is unused)
+    - noctx         # HTTP/net calls must take a context
+    - contextcheck  # ctx flows from the caller; no fresh Background() mid-chain
+    - fatcontext    # contexts nested in loops / closures
+    # Error handling.
+    - errorlint     # %w wrapping, errors.Is/As instead of == / type assertions
+    - nilerr        # `if err != nil { return nil }`
+    - errchkjson    # unchecked json.Marshal/Encode on types that can fail
+    # Modernisation / hygiene.
+    - usestdlibvars
+    - copyloopvar
+    - intrange
+    - nolintlint    # every //nolint names its linter and says why
+    # Not enabled:
+    #   sqlclosecheck - v0.6.0 never reports pgx.Rows (an interface): a probe with an unclosed
+    #                   pgx Conn.Query gave no finding, so it would only look like coverage.
+    #                   pgx closes rows when Next returns false; early returns rely on
+    #                   `defer rows.Close()` / pgx.CollectRows (rowserrcheck covers Err).
+    #   spancheck     - no OpenTelemetry/OpenCensus spans in the module.
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # noisy; optimize only when profiling
+        - shadow         # idiomatic `if err :=` shadows; too noisy
+    rowserrcheck:
+      packages:
+        - github.com/jackc/pgx/v5
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    gosec:
+      excludes:
+        - G104 # audited unchecked errors (prefer errcheck)
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

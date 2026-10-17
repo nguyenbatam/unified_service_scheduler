@@ -1,0 +1,193 @@
+name: Cluster
+
+# The production-shaped stack (2 backends behind the gateway, Postgres, Redis, Kafka) with the
+# end-to-end checks unit/integration tests cannot cover: book on A / read on B, WebSocket fan-out
+# across instances, DMS operations + customer notifications, and the concurrent booking stress with
+# its SQL integrity pass, ending with the requirements matrix, and degraded dependencies (Redis
+# down, Kafka paused, a backend killed mid-hammer). Heavier than CI (image builds + Kafka), so it runs on pull requests that touch
+# the backend, the web app, the scripts, the deployment, or the env template, after merges, nightly, and on demand. The checks
+# themselves are scripts/cluster-checks.sh, which ./scripts/check-all.sh also runs (one step per
+# check here, so a failure names it).
+on:
+  pull_request:
+    paths:
+      - "backend/**"
+      - "web/**"
+      - "scripts/**"
+      - "deploy/**"
+      - "docker-compose.yml"
+      - ".env.example"
+      - ".github/workflows/cluster.yml"
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      concurrency:
+        description: Requests per hammered slot
+        default: "300"
+      slots:
+        description: Slots per stress phase
+        default: "3"
+
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes its run (one group per PR ref, in-progress runs
+# cancelled). Every other run — a main push, the nightly schedule, a manual run — gets a group of
+# its own per event and commit: with cancel-in-progress false GitHub would still cancel the
+# *pending* run of a shared group when a third one joins, so a shared group could drop a commit's
+# verdict; the event name keeps a schedule and a push of the same sha apart.
+concurrency:
+  group: cluster-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Two legs on runners of their own, each on a fresh stack: the checks (stack, smoke, cluster, ws,
+  # dms, the full stress run) and the chaos runs (Redis down, Kafka paused, a backend killed
+  # mid-hammer), which need nothing the checks leave behind — so the slowest leg sets the time.
+  cluster:
+    name: cluster (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [checks, chaos]
+    # Every long step has its own limit — image builds 15 each, compose up 8, each smoke 5, the full
+    # stress 20, chaos 45 (two more stress runs: Redis down, a backend killed mid-hammer; and Kafka's
+    # recovery) — so a hung step fails on its own (a stress run first at STRESS_TIMEOUT, then its
+    # cleanup) and the log, artifact, and summary steps still run inside the job's limit. A normal
+    # run takes a fraction of it; only every step running close to its own limit could reach it.
+    timeout-minutes: 75
+    env:
+      # Per stress run (1 in the checks leg, 2 in the chaos leg): the run's deadline; its cleanup
+      # (≤ 5 min) and the binary's build come on top, inside the stress step's 20 and the chaos
+      # step's 45 minutes.
+      STRESS_TIMEOUT: 12m
+      CONCURRENCY: ${{ github.event.inputs.concurrency || '300' }}
+      SLOTS: ${{ github.event.inputs.slots || '3' }}
+      # Q3 budgets for a shared hosted runner, which holds the whole stack and the load generator on
+      # a few vCPUs: the defaults are ~3× a laptop's p99 (docs/testing.md). Measured on runners
+      # (same code): fill booking p99 0.67–1.04 s, Σ pool wait ≤ 1.2 s with a backend briefly at its
+      # pool cap, and hammer p99 11.4 / 13.2 / 25.6 s — the closed-loop hammer (900 requests at once
+      # into one dealership-day, 4 per instance past the day gate) is the time to drain that queue,
+      # so it follows the runner's CPU. About 2× the worst of each, so Q3 still fails a gate or lock
+      # that stalls requests; laptop budgets stay in check-all.sh.
+      SLO_HAMMER_MS: "60000"
+      SLO_BOOK_MS: "3000"
+      SLO_SIDE_MS: "2000"
+      SLO_OTHER_DAY_MS: "2000"
+      POOL_WAIT_BUDGET_MS: "6000"
+      POOL_CAP_FAILS: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: docker/setup-buildx-action@v3
+
+      # Built once per leg (the only image builds on CI: the GHA layer cache carries over between
+      # runs, and only the checks leg writes it, so the two legs never race on one cache scope) and
+      # loaded under the tags docker-compose.yml uses, so `compose up` below starts them without
+      # building again. One image per Dockerfile: backend-1 and backend-2 run the same one.
+      - name: Build backend image
+        timeout-minutes: 15
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          load: true
+          tags: unified-service-scheduler/backend:local
+          cache-from: type=gha,scope=backend
+          cache-to: ${{ matrix.suite == 'checks' && 'type=gha,scope=backend,mode=max' || '' }}
+      - name: Build web image
+        timeout-minutes: 15
+        uses: docker/build-push-action@v6
+        with:
+          context: web
+          load: true
+          tags: unified-service-scheduler/web:local
+          cache-from: type=gha,scope=web
+          cache-to: ${{ matrix.suite == 'checks' && 'type=gha,scope=web,mode=max' || '' }}
+
+      - name: Start the stack
+        timeout-minutes: 8
+        run: |
+          # Creates .env from .env.example with a freshly generated JWT_SECRET.
+          source scripts/ensure-env.sh
+          # Every service has a healthcheck; --wait fails on timeout instead of polling forever.
+          docker compose up -d --no-build --wait --wait-timeout 300
+          # Database clock at stack start: the notification check only counts this run's rows.
+          # Assigned first: inside echo "$(…)" a psql failure would be ignored and leave RUN_START
+          # empty (cluster-checks.sh would then fall back to the clock at its own start).
+          run_start=$(docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc 'SELECT now()')
+          echo "RUN_START=${run_start}" >> "$GITHUB_ENV"
+
+      - name: Stack health (gateway, backend identities, metrics, Prometheus scraping both)
+        timeout-minutes: 5
+        run: bash scripts/cluster-checks.sh stack
+
+      - name: Gateway smoke
+        if: matrix.suite == 'checks'
+        timeout-minutes: 5
+        run: bash scripts/cluster-checks.sh smoke
+
+      - name: Multi-instance sync (book on A, replay/read/cancel on B)
+        if: matrix.suite == 'checks'
+        timeout-minutes: 5
+        run: bash scripts/cluster-checks.sh cluster
+
+      - name: WebSocket fan-out (book on A, event on B)
+        if: matrix.suite == 'checks'
+        timeout-minutes: 5
+        run: bash scripts/cluster-checks.sh ws
+
+      - name: DMS operations + customer notifications
+        if: matrix.suite == 'checks'
+        timeout-minutes: 5
+        run: bash scripts/cluster-checks.sh dms
+
+      # Each stress run appends its compact requirements matrix to the job summary.
+      - name: Stress + SQL integrity (requirements matrix)
+        if: matrix.suite == 'checks'
+        timeout-minutes: 20
+        run: |
+          REPORT_JSON="$GITHUB_WORKSPACE/stress-report.json" STRESS_SUMMARY_MD="$GITHUB_STEP_SUMMARY" \
+            bash scripts/cluster-checks.sh stress
+
+      - name: Requirements matrix (JSON)
+        if: always() && matrix.suite == 'checks'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-report
+          path: stress-report.json
+          if-no-files-found: ignore
+
+      - name: Chaos (Redis down, Kafka paused, backend killed mid-hammer)
+        if: matrix.suite == 'chaos'
+        timeout-minutes: 45
+        run: |
+          CHAOS_REPORT_DIR="$GITHUB_WORKSPACE/chaos-reports" STRESS_SUMMARY_MD="$GITHUB_STEP_SUMMARY" \
+            bash scripts/cluster-checks.sh chaos
+
+      - name: Chaos requirements matrices (JSON)
+        if: always() && matrix.suite == 'chaos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-stress-reports
+          path: chaos-reports/
+          if-no-files-found: ignore
+
+      # failure() also covers a step that hit its timeout-minutes; cancelled() a cancelled run.
+      - name: Logs on failure
+        if: failure() || cancelled()
+        timeout-minutes: 5
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail=300
+
+      - name: Stop the stack
+        if: always()
+        timeout-minutes: 5
+        run: docker compose down -v

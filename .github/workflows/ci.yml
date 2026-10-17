@@ -1,0 +1,223 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes its run (one group per PR ref, in-progress runs
+# cancelled). Pushes to main/master get a group per commit: with cancel-in-progress false GitHub
+# would still cancel the *pending* run of a shared group when a third one joins, leaving that
+# commit without a verdict; keyed by sha, every pushed commit runs.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# The Docker images are built (and run) by the Cluster workflow, on every push to main/master and on
+# pull requests touching their contexts, so this workflow does not build them again.
+jobs:
+  # Applied migrations are immutable (the runner applies each file once by name): fail when a PR,
+  # or a push vs its previous commit, modifies, deletes or renames an existing migration.
+  migrations:
+    name: migrations immutable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the PR base / the push's "before" commit must be present to diff against.
+          fetch-depth: 0
+      - name: No existing migration modified, deleted or renamed
+        env:
+          # A new branch's first push has an all-zero "before": the script skips with a notice. A
+          # base missing from the clone (force push) is fetched; still missing fails on CI.
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          # A push's "before" is also diffed directly (a force push's merge-base is older than it).
+          MIGRATIONS_DIRECT: ${{ github.event_name == 'push' && '1' || '' }}
+        run: ./scripts/check-migrations.sh "$BASE"
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    # golangci-lint + govulncheck + tsc take a few minutes cold; a hung tool fails the job instead of
+    # holding a runner for GitHub's 6-hour default.
+    timeout-minutes: 20
+    env:
+      # lint.sh runs check-migrations.sh too: give it the same base as the migrations job, with the
+      # history to diff against (at the default depth 1 it would fall back to HEAD and check nothing).
+      MIGRATIONS_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+      MIGRATIONS_DIRECT: ${{ github.event_name == 'push' && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # golangci-lint keeps its analysis cache here (go tool golangci-lint, pinned in go.mod). Keyed
+      # by what invalidates it — the dependency set and the linter config — not by commit: a per-sha
+      # key saved a new cache on every push and evicted the useful ones. actions/cache never
+      # overwrites a key, so the cache is saved once per (go.sum, config) and later pushes re-analyse
+      # only the packages changed since (the cache is content-addressed per package, so an older
+      # tree's entries stay valid); restore-keys seeds a new key from this OS's latest cache.
+      - name: Cache golangci-lint
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/golangci-lint
+          key: golangci-${{ runner.os }}-${{ hashFiles('backend/go.sum', 'backend/.golangci.yml') }}
+          restore-keys: |
+            golangci-${{ runner.os }}-
+      # ubuntu runners ship shellcheck; lint.sh fails on CI (CI=true) when it is missing.
+      - name: shellcheck present
+        run: shellcheck --version
+      # OpenAPI copies, migrations, shellcheck, gofmt, go vet, golangci-lint, go mod tidy -diff,
+      # govulncheck (go tool), tsc, file size.
+      - name: Lint (same as ./scripts/lint.sh)
+        run: ./scripts/lint.sh
+
+  # Shards on runners of their own, each with a Postgres of its own: the integration package (the
+  # longest, ~3.5 min alone on a runner) dealt into 3 by test name (scripts/lib/go-test-shard.sh:
+  # every top-level test in exactly one shard; the DB benchmarks run in the first), and every other
+  # package (cmd/stress's SQL-oracle tests need Postgres too). Coverage is reported per shard.
+  test:
+    name: test (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # go test's own -timeout 15m covers the shard; the rest is setup and benchmarks.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # index/of on every integration row: a shard added here without raising `of` everywhere
+        # would leave the tests dealt to it unrun.
+        include:
+          - { shard: integration 1/3, key: integration-1, index: 1, of: 3 }
+          - { shard: integration 2/3, key: integration-2, index: 2, of: 3 }
+          - { shard: integration 3/3, key: integration-3, index: 3, of: 3 }
+          - { shard: packages, key: packages }
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: scheduler
+          POSTGRES_PASSWORD: scheduler
+          POSTGRES_DB: scheduler_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U scheduler -d scheduler_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:8.2.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://scheduler:scheduler@127.0.0.1:5432/scheduler_test?sslmode=disable
+      # Without it the Redis-backed tests (internal/cache, idempotency fast path) skip.
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      REQUIRE_INTEGRATION: "1"
+      # Parallel integration tests each own a database from the template with a 32-conn pool, and
+      # some open further pools on it (newPoolLike: up to 20 more each). An integration shard has
+      # its Postgres to itself (no other test binary on it), raised to max_connections 300 below
+      # like the compose stack: the package's default cap of 5 open test DBs (5 × ~52 = 260 at
+      # worst) fits, so ITEST_MAX_DBS is not lowered here.
+    steps:
+      # Service containers take no command arguments, so the default max_connections (100) is
+      # raised with ALTER SYSTEM and a restart, then checked.
+      - name: Postgres max_connections = 300
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "$PG_CONTAINER" psql -U scheduler -d scheduler_test -c "ALTER SYSTEM SET max_connections = 300"
+          docker restart "$PG_CONTAINER"
+          for _ in $(seq 1 30); do
+            docker exec "$PG_CONTAINER" pg_isready -U scheduler -d scheduler_test && break
+            sleep 1
+          done
+          got=$(docker exec "$PG_CONTAINER" psql -U scheduler -d scheduler_test -Atc "SHOW max_connections")
+          [ "$got" = 300 ] || { echo "max_connections is $got, want 300"; exit 1; }
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      # go vet runs in the lint job. -coverpkg counts the tests' coverage of every internal package,
+      # not only of the package the test lives in.
+      - name: Backend tests, ${{ matrix.shard }} (race detector on every package)
+        working-directory: backend
+        env:
+          SHARD_INDEX: ${{ matrix.index }}
+          SHARD_TOTAL: ${{ matrix.of }}
+        run: |
+          if [ -n "$SHARD_INDEX" ]; then
+            run=$(../scripts/lib/go-test-shard.sh internal/integration "$SHARD_INDEX" "$SHARD_TOTAL")
+            go test -count=1 -race -timeout 15m -coverpkg=./internal/... -coverprofile=coverage.out \
+              -run "$run" ./internal/integration/
+          else
+            # shellcheck disable=SC2046 # one package per word
+            go test -count=1 -race -timeout 15m -coverpkg=./internal/... -coverprofile=coverage.out \
+              $(go list ./... | grep -v '/internal/integration$')
+          fi
+      - name: Database benchmarks (smoke, 20 iterations)
+        if: matrix.key == 'integration-1'
+        working-directory: backend
+        run: go test -count=1 -run '^$' -bench . -benchtime 20x ./internal/integration/
+      - name: Coverage summary (informational)
+        if: always()
+        continue-on-error: true
+        working-directory: backend
+        run: |
+          [ -s coverage.out ] || { echo "no coverage profile"; exit 0; }
+          go tool cover -func=coverage.out > coverage.txt
+          {
+            echo "### Backend coverage, ${{ matrix.shard }} shard (-coverpkg=./internal/...)"
+            echo
+            echo '```'
+            tail -n 1 coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          tail -n 1 coverage.txt
+      - name: Upload coverage profile
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage-${{ matrix.key }}
+          path: |
+            backend/coverage.out
+            backend/coverage.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  web:
+    name: web
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Web tests + build
+        working-directory: web
+        run: |
+          npm ci
+          npm test
+          npm run build

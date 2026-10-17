@@ -1,0 +1,44 @@
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Agent local overrides (shared config lives in .claude/ and AGENTS.md)
+.claude/settings.local.json
+CLAUDE.local.md
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Go
+bin/
+# `go build` run inside backend/ (cmd/server, cmd/stress) drops the binary there.
+/backend/server
+/backend/stress
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.html
+vendor/
+tmp/
+
+# Node / web
+web/node_modules/
+web/dist/
+
+# Misc
+*.log
+.cache/
+
+# go build ./cmd/stress output (the scripts build into backend/bin/)
+backend/cmd/stress/stress
